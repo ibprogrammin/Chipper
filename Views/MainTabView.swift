@@ -8,17 +8,12 @@ struct MainTabView: View {
         TabView {
             MapView()
                 .tabItem {
-                    Label("Nearby", systemImage: "map")
+                    Label("Map", systemImage: "map")
                 }
             
             ConnectionsView()
                 .tabItem {
                     Label("Connections", systemImage: "person.2")
-                }
-            
-            ChatsListView()
-                .tabItem {
-                    Label("Chats", systemImage: "message")
                 }
             
             ProfileView()

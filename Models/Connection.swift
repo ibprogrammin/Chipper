@@ -1,6 +1,7 @@
 // Connection.swift
 
 import Foundation
+import CoreLocation
 import FirebaseFirestore
 
 struct Connection: Identifiable, Codable {
@@ -10,15 +11,9 @@ struct Connection: Identifiable, Codable {
     var status: ConnectionStatus
     let initiatedBy: String
     let iceBreaker: String
-    let createdAt: Timestamp
+    let createdAt: Date
     
     enum ConnectionStatus: String, Codable {
-        case pending
-        case accepted
-        case declined
-    }
-    
-    func otherUserId(currentUserId: String) -> String {
-        return currentUserId == user1 ? user2 : user1
+        case pending, accepted, declined
     }
 }

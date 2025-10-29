@@ -7,5 +7,5 @@ struct Message: Identifiable, Codable {
     @DocumentID var id: String?
     let senderId: String
     let text: String
-    let timestamp: Timestamp
+    let timestamp: Date
 }

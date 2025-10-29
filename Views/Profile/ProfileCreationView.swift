@@ -5,95 +5,88 @@ import SwiftUI
 import PhotosUI
 
 struct ProfileCreationView: View {
-    @EnvironmentObject var authManager: AuthenticationManager
-    @State private var displayName = ""
-    @State private var bio = ""
-    @State private var selectedPhoto: PhotosPickerItem?
-    @State private var avatarImage: UIImage?
-    @State private var isUploading = false
+    @EnvironmentObject var authViewModel: AuthenticationViewModel
+    @StateObject private var viewModel = ProfileViewModel()
+    @StateObject private var locationManager = LocationManager()
+    @State private var selectedItem: PhotosPickerItem?
     
     var body: some View {
         NavigationView {
             Form {
-                Section("Profile Photo") {
+                Section("Avatar") {
                     HStack {
                         Spacer()
-                        
-                        if let avatarImage = avatarImage {
-                            Image(uiImage: avatarImage)
+                        if let image = viewModel.selectedImage {
+                            Image(uiImage: image)
                                 .resizable()
                                 .scaledToFill()
                                 .frame(width: 120, height: 120)
                                 .clipShape(Circle())
                         } else {
-                            Image(systemName: "person.circle.fill")
-                                .resizable()
-                                .frame(width: 120, height: 120)
+                            Image(systemName: "person.crop.circle.fill")
+                                .font(.system(size: 120))
                                 .foregroundColor(.gray)
                         }
-                        
                         Spacer()
                     }
                     
-                    PhotosPicker(selection: $selectedPhoto, matching: .images) {
+                    PhotosPicker(selection: $selectedItem, matching: .images) {
                         Label("Choose Photo", systemImage: "photo")
                     }
-                    .onChange(of: selectedPhoto) { newValue in
+                    .onChange(of: selectedItem) { newItem in
                         Task {
-                            if let data = try? await newValue?.loadTransferable(type: Data.self),
+                            if let data = try? await newItem?.loadTransferable(type: Data.self),
                                let image = UIImage(data: data) {
-                                avatarImage = image
+                                viewModel.selectedImage = image
                             }
                         }
                     }
                 }
                 
-                Section("About You") {
-                    TextField("Display Name", text: $displayName)
-                    
-                    TextField("Bio (optional)", text: $bio, axis: .vertical)
+                Section("Profile") {
+                    TextField("Display Name", text: $viewModel.displayName)
+                    TextField("Bio", text: $viewModel.bio, axis: .vertical)
                         .lineLimit(3...6)
                 }
                 
+                Section("Privacy") {
+                    Toggle("Visible to nearby users", isOn: $viewModel.isVisible)
+                }
+                
                 Section {
-                    Button(action: createProfile) {
-                        if isUploading {
+                    Button(action: saveProfile) {
+                        if viewModel.isLoading {
                             ProgressView()
                         } else {
-                            Text("Complete Profile")
+                            Text("Create Profile")
                         }
                     }
-                    .disabled(displayName.isEmpty || isUploading)
+                    .disabled(viewModel.displayName.isEmpty || viewModel.isLoading || locationManager.location == nil)
+                }
+                
+                if let error = viewModel.errorMessage {
+                    Section {
+                        Text(error)
+                            .foregroundColor(.red)
+                    }
                 }
             }
             .navigationTitle("Create Profile")
+            .onAppear {
+                locationManager.requestPermission()
+            }
         }
     }
     
-    func createProfile() {
-        guard let userId = authManager.currentUser?.uid else { return }
-        isUploading = true
+    private func saveProfile() {
+        guard let userId = authViewModel.currentUser?.uid,
+              let location = locationManager.location else { return }
         
-        if let avatarImage = avatarImage {
-            FirebaseService.shared.uploadAvatar(userId: userId, image: avatarImage) { avatarURL in
-                saveProfile(userId: userId, avatarURL: avatarURL)
-            }
-        } else {
-            saveProfile(userId: userId, avatarURL: nil)
-        }
-    }
-    
-    func saveProfile(userId: String, avatarURL: String?) {
-        FirebaseService.shared.createUserProfile(
-            userId: userId,
-            displayName: displayName,
-            bio: bio,
-            avatarURL: avatarURL
-        ) { error in
-            isUploading = false
-            if error == nil {
-                authManager.hasCompletedProfile = true
-            }
+        Task {
+            await viewModel.saveProfile(userId: userId, coordinate: location.coordinate)
+            
+            // Refresh user profile
+            authViewModel.userProfile = try? await FirebaseService.shared.fetchUserProfile(userId: userId)
         }
     }
 }

@@ -1,195 +1,134 @@
 // MARK: - Firebase Service
 // FirebaseService.swift
 
-import Foundation
-import FirebaseFirestore
+import FirebaseAuth
 import FirebaseStorage
-import UIKit
-import CoreLocation
+import FirebaseFirestore
 
 class FirebaseService {
     static let shared = FirebaseService()
-    private let db = Firestore.firestore()
-    private let storage = Storage.storage()
+    let db = Firestore.firestore()
+    let storage = Storage.storage()
+    
+    private init() {}
     
     // MARK: - User Profile
-    
-    func createUserProfile(userId: String, displayName: String, bio: String, avatarURL: String?, completion: @escaping (Error?) -> Void) {
-        let profile: [String: Any] = [
-            "userId": userId,
-            "displayName": displayName,
-            "bio": bio,
-            "avatarURL": avatarURL ?? "",
-            "isVisible": true,
-            "lastActive": Timestamp()
-        ]
-        
-        db.collection("users").document(userId).setData(profile) { error in
-            completion(error)
-        }
+    func createUserProfile(_ profile: UserProfile) async throws {
+        try db.collection("users").document(profile.userId).setData(from: profile)
     }
     
-    func updateUserLocation(userId: String, location: CLLocation) {
-        let geoPoint = GeoPoint(latitude: location.coordinate.latitude, longitude: location.coordinate.longitude)
-        let geohash = LocationManager.shared.geohash(latitude: location.coordinate.latitude, longitude: location.coordinate.longitude)
+    func updateUserProfile(_ profile: UserProfile) async throws {
+        guard let userId = profile.id else { return }
+        try db.collection("users").document(userId).setData(from: profile, merge: true)
+    }
+    
+    func fetchUserProfile(userId: String) async throws -> UserProfile? {
+        let document = try await db.collection("users").document(userId).getDocument()
+        return try document.data(as: UserProfile.self)
+    }
+    
+    func updateUserLocation(userId: String, coordinate: CLLocationCoordinate2D) async throws {
+        let geohash = Geohash.encode(latitude: coordinate.latitude, longitude: coordinate.longitude, precision: 7)
         
-        db.collection("users").document(userId).updateData([
-            "location": geoPoint,
+        try await db.collection("users").document(userId).updateData([
+            "latitude": coordinate.latitude,
+            "longitude": coordinate.longitude,
             "geohash": geohash,
-            "lastActive": Timestamp()
+            "lastActive": FieldValue.serverTimestamp()
         ])
     }
     
-    func fetchUserProfile(userId: String, completion: @escaping (UserProfile?) -> Void) {
-        db.collection("users").document(userId).getDocument { snapshot, error in
-            guard let data = snapshot?.data() else {
-                completion(nil)
-                return
-            }
-            
-            do {
-                let jsonData = try JSONSerialization.data(withJSONObject: data)
-                let profile = try JSONDecoder().decode(UserProfile.self, from: jsonData)
-                completion(profile)
-            } catch {
-                print("Error decoding profile: \(error)")
-                completion(nil)
-            }
-        }
-    }
-    
-    func fetchNearbyUsers(geohash: String, completion: @escaping ([UserProfile]) -> Void) {
-        // Query users with similar geohash (within ~200m)
-        let geohashPrefix = String(geohash.prefix(6)) // Adjust precision for ~200m radius
+    func fetchNearbyUsers(center: CLLocationCoordinate2D, radiusInMeters: Double = 200) async throws -> [UserProfile] {
+        let geohash = Geohash.encode(latitude: center.latitude, longitude: center.longitude, precision: 5)
+        let neighbors = Geohash.neighbors(geohash: geohash)
         
-        db.collection("users")
-            .whereField("geohash", isGreaterThanOrEqualTo: geohashPrefix)
-            .whereField("geohash", isLessThan: geohashPrefix + "~")
-            .whereField("isVisible", isEqualTo: true)
-            .getDocuments { snapshot, error in
-                guard let documents = snapshot?.documents else {
-                    completion([])
-                    return
-                }
-                
-                let profiles = documents.compactMap { doc -> UserProfile? in
-                    try? doc.data(as: UserProfile.self)
-                }
-                completion(profiles)
-            }
+        var allUsers: [UserProfile] = []
+        
+        for hash in [geohash] + neighbors {
+            let snapshot = try await db.collection("users")
+                .whereField("geohash", isGreaterThanOrEqualTo: hash)
+                .whereField("geohash", isLessThan: hash + "~")
+                .whereField("isVisible", isEqualTo: true)
+                .getDocuments()
+            
+            let users = try snapshot.documents.compactMap { try $0.data(as: UserProfile.self) }
+            allUsers.append(contentsOf: users)
+        }
+        
+        // Filter by actual distance
+        return allUsers.filter { user in
+            let distance = center.distance(to: user.coordinate)
+            return distance <= radiusInMeters
+        }
     }
     
     // MARK: - Avatar Upload
-    
-    func uploadAvatar(userId: String, image: UIImage, completion: @escaping (String?) -> Void) {
-        guard let resizedImage = image.resized(to: CGSize(width: 400, height: 400)),
-              let imageData = resizedImage.jpegData(compressionQuality: 0.8) else {
-            completion(nil)
-            return
+    func uploadAvatar(userId: String, image: UIImage) async throws -> String {
+        guard let imageData = image.jpegData(compressionQuality: 0.7) else {
+            throw NSError(domain: "ImageError", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to compress image"])
         }
         
-        let ref = storage.reference().child("avatars/\(userId)/profile.jpg")
+        let storageRef = storage.reference().child("avatars/\(userId)/profile.jpg")
+        let metadata = StorageMetadata()
+        metadata.contentType = "image/jpeg"
         
-        ref.putData(imageData, metadata: nil) { metadata, error in
-            if let error = error {
-                print("Upload error: \(error)")
-                completion(nil)
-                return
-            }
-            
-            ref.downloadURL { url, error in
-                completion(url?.absoluteString)
-            }
-        }
+        _ = try await storageRef.putDataAsync(imageData, metadata: metadata)
+        let downloadURL = try await storageRef.downloadURL()
+        return downloadURL.absoluteString
     }
     
     // MARK: - Connections
-    
-    func sendIceBreakerRequest(fromUserId: String, toUserId: String, iceBreaker: String, completion: @escaping (Error?) -> Void) {
-        let connectionId = [fromUserId, toUserId].sorted().joined(separator: "_")
+    func sendIceBreakerRequest(from senderId: String, to receiverId: String, iceBreaker: String) async throws {
+        let connectionId = [senderId, receiverId].sorted().joined(separator: "_")
         
-        let connection: [String: Any] = [
-            "user1": fromUserId < toUserId ? fromUserId : toUserId,
-            "user2": fromUserId < toUserId ? toUserId : fromUserId,
-            "status": "pending",
-            "initiatedBy": fromUserId,
-            "iceBreaker": iceBreaker,
-            "createdAt": Timestamp()
-        ]
+        let connection = Connection(
+            id: connectionId,
+            user1: senderId,
+            user2: receiverId,
+            status: .pending,
+            initiatedBy: senderId,
+            iceBreaker: iceBreaker,
+            createdAt: Date()
+        )
         
-        db.collection("connections").document(connectionId).setData(connection) { error in
-            completion(error)
-        }
+        try db.collection("connections").document(connectionId).setData(from: connection)
     }
     
-    func updateConnectionStatus(connectionId: String, status: String, completion: @escaping (Error?) -> Void) {
-        db.collection("connections").document(connectionId).updateData([
-            "status": status
-        ]) { error in
-            completion(error)
-        }
+    func updateConnectionStatus(connectionId: String, status: Connection.ConnectionStatus) async throws {
+        try await db.collection("connections").document(connectionId).updateData([
+            "status": status.rawValue
+        ])
     }
     
-    func fetchPendingConnections(userId: String, completion: @escaping ([Connection]) -> Void) {
-        db.collection("connections")
-            .whereField("status", isEqualTo: "pending")
-            .getDocuments { snapshot, error in
-                guard let documents = snapshot?.documents else {
-                    completion([])
-                    return
-                }
-                
-                let connections = documents.compactMap { doc -> Connection? in
-                    try? doc.data(as: Connection.self)
-                }.filter { $0.user1 == userId || $0.user2 == userId }
-                
-                completion(connections)
-            }
-    }
-    
-    func fetchAcceptedConnections(userId: String, completion: @escaping ([Connection]) -> Void) {
-        db.collection("connections")
-            .whereField("status", isEqualTo: "accepted")
-            .getDocuments { snapshot, error in
-                guard let documents = snapshot?.documents else {
-                    completion([])
-                    return
-                }
-                
-                let connections = documents.compactMap { doc -> Connection? in
-                    try? doc.data(as: Connection.self)
-                }.filter { $0.user1 == userId || $0.user2 == userId }
-                
-                completion(connections)
-            }
+    func fetchConnections(for userId: String) async throws -> [Connection] {
+        let snapshot1 = try await db.collection("connections")
+            .whereField("user1", isEqualTo: userId)
+            .getDocuments()
+        
+        let snapshot2 = try await db.collection("connections")
+            .whereField("user2", isEqualTo: userId)
+            .getDocuments()
+        
+        let connections1 = try snapshot1.documents.compactMap { try $0.data(as: Connection.self) }
+        let connections2 = try snapshot2.documents.compactMap { try $0.data(as: Connection.self) }
+        
+        return connections1 + connections2
     }
     
     // MARK: - Messaging
-    
-    func sendMessage(connectionId: String, senderId: String, text: String, completion: @escaping (Error?) -> Void) {
-        let message: [String: Any] = [
-            "senderId": senderId,
-            "text": text,
-            "timestamp": Timestamp()
-        ]
-        
-        db.collection("messages").document(connectionId).collection("messages").addDocument(data: message) { error in
-            completion(error)
-        }
+    func sendMessage(connectionId: String, senderId: String, text: String) async throws {
+        let message = Message(senderId: senderId, text: text, timestamp: Date())
+        try db.collection("messages").document(connectionId)
+            .collection("messages").addDocument(from: message)
     }
     
     func listenToMessages(connectionId: String, completion: @escaping ([Message]) -> Void) -> ListenerRegistration {
-        return db.collection("messages").document(connectionId).collection("messages")
+        return db.collection("messages").document(connectionId)
+            .collection("messages")
             .order(by: "timestamp", descending: false)
             .addSnapshotListener { snapshot, error in
-                guard let documents = snapshot?.documents else {
-                    completion([])
-                    return
-                }
-                
-                let messages = documents.compactMap { doc -> Message? in
-                    try? doc.data(as: Message.self)
-                }
+                guard let documents = snapshot?.documents else { return }
+                let messages = documents.compactMap { try? $0.data(as: Message.self) }
                 completion(messages)
             }
     }

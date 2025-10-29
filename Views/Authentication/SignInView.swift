@@ -5,26 +5,23 @@ import SwiftUI
 import AuthenticationServices
 
 struct SignInView: View {
-    @EnvironmentObject var authManager: AuthenticationManager
+    @EnvironmentObject var authViewModel: AuthenticationViewModel
+    @State private var errorMessage: String?
     
     var body: some View {
-        VStack(spacing: 30) {
+        VStack(spacing: 20) {
             Spacer()
             
-            VStack(spacing: 16) {
-                Image(systemName: "location.circle.fill")
-                    .font(.system(size: 80))
-                    .foregroundColor(.blue)
-                
-                Text("NearbyConnect")
-                    .font(.largeTitle)
-                    .fontWeight(.bold)
-                
-                Text("Break the ice with people nearby")
-                    .font(.subheadline)
-                    .foregroundColor(.secondary)
-                    .multilineTextAlignment(.center)
-            }
+            Image(systemName: "mappin.and.ellipse")
+                .font(.system(size: 80))
+                .foregroundColor(.blue)
+            
+            Text("Chipper")
+                .font(.largeTitle)
+                .bold()
+            
+            Text("Connect with people nearby")
+                .foregroundColor(.gray)
             
             Spacer()
             
@@ -34,15 +31,29 @@ struct SignInView: View {
                 switch result {
                 case .success(let authorization):
                     if let credential = authorization.credential as? ASAuthorizationAppleIDCredential {
-                        authManager.handleSignInWithApple(credential: credential)
+                        Task {
+                            do {
+                                try await authViewModel.signInWithApple(credential: credential)
+                            } catch {
+                                errorMessage = error.localizedDescription
+                            }
+                        }
                     }
                 case .failure(let error):
-                    print("Sign in error: \(error)")
+                    errorMessage = error.localizedDescription
                 }
             }
+            .signInWithAppleButtonStyle(.black)
             .frame(height: 50)
             .padding(.horizontal, 40)
-            .padding(.bottom, 50)
+            
+            if let error = errorMessage {
+                Text(error)
+                    .foregroundColor(.red)
+                    .font(.caption)
+            }
+            
+            Spacer()
         }
         .padding()
     }

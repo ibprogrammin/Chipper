@@ -12,12 +12,12 @@ struct UserProfile: Identifiable, Codable {
     var bio: String
     var avatarURL: String?
     var isVisible: Bool
-    var location: GeoPoint?
-    var geohash: String?
-    var lastActive: Timestamp
+    var latitude: Double
+    var longitude: Double
+    var geohash: String
+    var lastActive: Date
     
-    var coordinate: CLLocationCoordinate2D? {
-        guard let location = location else { return nil }
-        return CLLocationCoordinate2D(latitude: location.latitude, longitude: location.longitude)
+    var coordinate: CLLocationCoordinate2D {
+        CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
     }
 }

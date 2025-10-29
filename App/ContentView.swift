@@ -3,13 +3,14 @@
 
 import SwiftUI
 
+// MARK: - Views
 struct ContentView: View {
-    @EnvironmentObject var authManager: AuthenticationManager
+    @EnvironmentObject var authViewModel: AuthenticationViewModel
     
     var body: some View {
         Group {
-            if authManager.isAuthenticated {
-                if authManager.hasCompletedProfile {
+            if authViewModel.isAuthenticated {
+                if authViewModel.userProfile != nil {
                     MainTabView()
                 } else {
                     ProfileCreationView()

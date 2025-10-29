@@ -1,0 +1,639 @@
+// MARK: - Chipper Automated UI Tests
+// File: ChipperUITests.swift
+
+import XCTest
+
+class ChipperUITests: XCTestCase {
+    var app: XCUIApplication!
+    
+    override func setUpWithError() throws {
+        continueAfterFailure = false
+        app = XCUIApplication()
+        app.launchArguments = ["UI-Testing"]
+        app.launch()
+    }
+    
+    override func tearDownWithError() throws {
+        app = nil
+    }
+    
+    // MARK: - Authentication Tests
+    
+    func testAT001_SignInButtonExists() throws {
+        // AT-001: User can tap "Sign In with Apple" button
+        let signInButton = app.buttons["Sign in with Apple"]
+        XCTAssertTrue(signInButton.exists, "Sign in with Apple button should exist")
+        XCTAssertTrue(signInButton.isEnabled, "Sign in button should be enabled")
+    }
+    
+    func testAT007_FirstTimeUserFlow() throws {
+        // AT-007: First-time user is directed to Profile Creation screen
+        // Mock first-time user
+        app.launchArguments.append("First-Time-User")
+        app.launch()
+        
+        // Simulate sign in
+        let signInButton = app.buttons["Sign in with Apple"]
+        signInButton.tap()
+        
+        // Wait for profile creation screen
+        let profileCreationTitle = app.navigationBars["Create Profile"]
+        XCTAssertTrue(profileCreationTitle.waitForExistence(timeout: 5), "Profile creation screen should appear")
+    }
+    
+    func testAT008_ReturningUserFlow() throws {
+        // AT-008: Returning user with existing profile goes to Map View
+        app.launchArguments.append("Returning-User")
+        app.launch()
+        
+        // Should go directly to map
+        let mapTitle = app.navigationBars["Nearby"]
+        XCTAssertTrue(mapTitle.waitForExistence(timeout: 5), "Map view should appear for returning users")
+    }
+    
+    // MARK: - Profile Creation Tests
+    
+    func testAT012_PhotoPickerOpens() throws {
+        // AT-012: User can tap "Choose Photo" to open photo picker
+        navigateToProfileCreation()
+        
+        let choosePhotoButton = app.buttons["Choose Photo"]
+        XCTAssertTrue(choosePhotoButton.exists, "Choose Photo button should exist")
+        
+        choosePhotoButton.tap()
+        
+        // Photo picker should appear (system sheet)
+        XCTAssertTrue(app.otherElements["PhotosPicker"].waitForExistence(timeout: 3), "Photo picker should open")
+    }
+    
+    func testAT018_DisplayNameInput() throws {
+        // AT-018: Display Name field accepts text input
+        navigateToProfileCreation()
+        
+        let nameField = app.textFields["Display Name"]
+        XCTAssertTrue(nameField.exists, "Display name field should exist")
+        
+        nameField.tap()
+        nameField.typeText("Test User")
+        
+        XCTAssertEqual(nameField.value as? String, "Test User", "Name field should contain typed text")
+    }
+    
+    func testAT019_DisplayNameRequired() throws {
+        // AT-019: Display Name is required (Create button disabled when empty)
+        navigateToProfileCreation()
+        
+        let createButton = app.buttons["Create Profile"]
+        XCTAssertFalse(createButton.isEnabled, "Create button should be disabled with empty name")
+        
+        let nameField = app.textFields["Display Name"]
+        nameField.tap()
+        nameField.typeText("Test User")
+        
+        // Button might need location permission too - handled in separate test
+    }
+    
+    func testAT020_BioInput() throws {
+        // AT-020: Bio field accepts multi-line text input
+        navigateToProfileCreation()
+        
+        let bioField = app.textViews["Bio"]
+        XCTAssertTrue(bioField.exists, "Bio field should exist")
+        
+        bioField.tap()
+        bioField.typeText("This is a test bio\nWith multiple lines\nFor testing")
+        
+        XCTAssertTrue(bioField.value as! String != "", "Bio should contain text")
+    }
+    
+    func testAT022_VisibilityToggle() throws {
+        // AT-022: "Visible to nearby users" toggle works correctly
+        navigateToProfileCreation()
+        
+        let visibilityToggle = app.switches["Visible to nearby users"]
+        XCTAssertTrue(visibilityToggle.exists, "Visibility toggle should exist")
+        
+        let initialValue = visibilityToggle.value as! String
+        visibilityToggle.tap()
+        let newValue = visibilityToggle.value as! String
+        
+        XCTAssertNotEqual(initialValue, newValue, "Toggle should change state")
+    }
+    
+    // MARK: - Map View Tests
+    
+    func testAT047_MapLoads() throws {
+        // AT-047: Map loads and displays user's current location
+        navigateToMap()
+        
+        let map = app.maps.firstMatch
+        XCTAssertTrue(map.exists, "Map should exist")
+        XCTAssertTrue(map.isHittable, "Map should be interactive")
+    }
+    
+    func testAT056_RefreshButtonVisible() throws {
+        // AT-056: "Refresh" button is visible on map
+        navigateToMap()
+        
+        let refreshButton = app.buttons["Refresh"]
+        XCTAssertTrue(refreshButton.exists, "Refresh button should exist")
+        XCTAssertTrue(refreshButton.isHittable, "Refresh button should be tappable")
+    }
+    
+    func testAT057_RefreshQueriesUsers() throws {
+        // AT-057: Tapping refresh queries nearby users
+        navigateToMap()
+        
+        let refreshButton = app.buttons["Refresh"]
+        refreshButton.tap()
+        
+        // Should show loading indicator briefly
+        let loadingIndicator = app.activityIndicators.firstMatch
+        XCTAssertTrue(loadingIndicator.waitForExistence(timeout: 1), "Loading indicator should appear")
+    }
+    
+    // MARK: - Ice Breaker Tests
+    
+    func testAT071_IceBreakerOpens() throws {
+        // AT-071: Tapping "Send Ice Breaker" opens ice breaker selection
+        navigateToMap()
+        tapFirstUserAnnotation()
+        
+        let sendButton = app.buttons["Send Ice Breaker"]
+        XCTAssertTrue(sendButton.exists, "Send Ice Breaker button should exist")
+        
+        sendButton.tap()
+        
+        let iceBreakerSheet = app.navigationBars["Choose Ice Breaker"]
+        XCTAssertTrue(iceBreakerSheet.waitForExistence(timeout: 2), "Ice breaker selection should appear")
+    }
+    
+    func testAT072_FiveIceBreakersAvailable() throws {
+        // AT-072: Ice breaker selection shows 5 pre-defined messages
+        navigateToIceBreakerSelection()
+        
+        let expectedMessages = [
+            "Hey, I'm nearby! 👋",
+            "Want to chat?",
+            "I noticed we're in the same area!",
+            "Mind if I say hi? 😊",
+            "Would love to connect!"
+        ]
+        
+        for message in expectedMessages {
+            let messageButton = app.buttons[message]
+            XCTAssertTrue(messageButton.exists, "Ice breaker '\(message)' should exist")
+        }
+    }
+    
+    func testAT073_IceBreakerSelection() throws {
+        // AT-073: User can select any of the 5 ice breaker options
+        navigateToIceBreakerSelection()
+        
+        let firstIceBreaker = app.buttons["Hey, I'm nearby! 👋"]
+        XCTAssertTrue(firstIceBreaker.isHittable, "Ice breaker should be tappable")
+        
+        firstIceBreaker.tap()
+        
+        // Sheet should dismiss
+        let iceBreakerSheet = app.navigationBars["Choose Ice Breaker"]
+        XCTAssertFalse(iceBreakerSheet.exists, "Ice breaker sheet should dismiss after selection")
+    }
+    
+    // MARK: - Connections Tests
+    
+    func testAT089_ConnectionsTabAccessible() throws {
+        // AT-089: Connections tab is accessible from tab bar
+        navigateToMap()
+        
+        let connectionsTab = app.tabBars.buttons["Connections"]
+        XCTAssertTrue(connectionsTab.exists, "Connections tab should exist")
+        
+        connectionsTab.tap()
+        
+        let connectionsTitle = app.navigationBars["Connections"]
+        XCTAssertTrue(connectionsTitle.exists, "Connections view should appear")
+    }
+    
+    func testAT093_EmptyConnectionsMessage() throws {
+        // AT-093: "No connections yet" message shows when list is empty
+        app.launchArguments.append("No-Connections")
+        navigateToConnections()
+        
+        let emptyMessage = app.staticTexts["No connections yet"]
+        XCTAssertTrue(emptyMessage.exists, "Empty state message should appear")
+    }
+    
+    func testAT097_PendingRequestAcceptButton() throws {
+        // AT-097: Pending request shows "Accept" button
+        app.launchArguments.append("Has-Pending-Request")
+        navigateToConnections()
+        
+        let acceptButton = app.buttons["Accept"]
+        XCTAssertTrue(acceptButton.exists, "Accept button should exist for pending request")
+        XCTAssertTrue(acceptButton.isEnabled, "Accept button should be enabled")
+    }
+    
+    func testAT098_PendingRequestDeclineButton() throws {
+        // AT-098: Pending request shows "Decline" button
+        app.launchArguments.append("Has-Pending-Request")
+        navigateToConnections()
+        
+        let declineButton = app.buttons["Decline"]
+        XCTAssertTrue(declineButton.exists, "Decline button should exist for pending request")
+        XCTAssertTrue(declineButton.isEnabled, "Decline button should be enabled")
+    }
+    
+    // MARK: - Chat Tests
+    
+    func testAT116_ChatOpens() throws {
+        // AT-116: Chat view opens with other user's name in nav bar
+        app.launchArguments.append("Has-Active-Connection")
+        navigateToConnections()
+        
+        let firstConnection = app.cells.firstMatch
+        firstConnection.tap()
+        
+        // Chat view should open
+        let chatNavBar = app.navigationBars.firstMatch
+        XCTAssertTrue(chatNavBar.waitForExistence(timeout: 2), "Chat view should open")
+    }
+    
+    func testAT126_MessageInput() throws {
+        // AT-126: User can type text in message input field
+        navigateToChat()
+        
+        let messageField = app.textFields["Message..."]
+        XCTAssertTrue(messageField.exists, "Message input field should exist")
+        
+        messageField.tap()
+        messageField.typeText("Test message")
+        
+        XCTAssertEqual(messageField.value as? String, "Test message", "Message field should contain typed text")
+    }
+    
+    func testAT127_SendButtonDisabledWhenEmpty() throws {
+        // AT-127: Send button is disabled when input is empty
+        navigateToChat()
+        
+        let sendButton = app.buttons.matching(identifier: "arrow.up.circle.fill").firstMatch
+        XCTAssertFalse(sendButton.isEnabled, "Send button should be disabled when message is empty")
+    }
+    
+    func testAT129_SendButtonEnabledWithText() throws {
+        // AT-129: Send button is enabled when text is entered
+        navigateToChat()
+        
+        let messageField = app.textFields["Message..."]
+        messageField.tap()
+        messageField.typeText("Test message")
+        
+        let sendButton = app.buttons.matching(identifier: "arrow.up.circle.fill").firstMatch
+        XCTAssertTrue(sendButton.isEnabled, "Send button should be enabled with text")
+    }
+    
+    func testAT130_SendMessage() throws {
+        // AT-130: Tapping send button sends message
+        navigateToChat()
+        
+        let messageField = app.textFields["Message..."]
+        messageField.tap()
+        let testMessage = "Test message \(Date().timeIntervalSince1970)"
+        messageField.typeText(testMessage)
+        
+        let sendButton = app.buttons.matching(identifier: "arrow.up.circle.fill").firstMatch
+        sendButton.tap()
+        
+        // Message should appear in chat
+        let messageText = app.staticTexts[testMessage]
+        XCTAssertTrue(messageText.waitForExistence(timeout: 3), "Sent message should appear in chat")
+    }
+    
+    // MARK: - Profile Tests
+    
+    func testAT153_ProfileTabAccessible() throws {
+        // AT-153: Profile tab accessible from tab bar
+        navigateToMap()
+        
+        let profileTab = app.tabBars.buttons["Profile"]
+        XCTAssertTrue(profileTab.exists, "Profile tab should exist")
+        
+        profileTab.tap()
+        
+        let profileTitle = app.navigationBars["Profile"]
+        XCTAssertTrue(profileTitle.exists, "Profile view should appear")
+    }
+    
+    func testAT159_SignOutButtonVisible() throws {
+        // AT-159: "Sign Out" button is visible
+        navigateToProfile()
+        
+        let signOutButton = app.buttons["Sign Out"]
+        XCTAssertTrue(signOutButton.exists, "Sign Out button should exist")
+    }
+    
+    func testAT161_SignOutConfirmation() throws {
+        // AT-161: Tapping "Sign Out" shows confirmation alert
+        navigateToProfile()
+        
+        let signOutButton = app.buttons["Sign Out"]
+        signOutButton.tap()
+        
+        let alert = app.alerts["Sign Out"]
+        XCTAssertTrue(alert.waitForExistence(timeout: 2), "Sign out confirmation alert should appear")
+        
+        let cancelButton = alert.buttons["Cancel"]
+        let signOutConfirmButton = alert.buttons["Sign Out"]
+        
+        XCTAssertTrue(cancelButton.exists, "Cancel button should exist in alert")
+        XCTAssertTrue(signOutConfirmButton.exists, "Sign Out button should exist in alert")
+    }
+    
+    // MARK: - Performance Tests
+    
+    func testAT200_AppLaunchPerformance() throws {
+        // AT-200: App launches within 3 seconds
+        measure(metrics: [XCTApplicationLaunchMetric()]) {
+            XCUIApplication().launch()
+        }
+    }
+    
+    func testAT201_MapLoadPerformance() throws {
+        // AT-201: Map loads within 2 seconds
+        navigateToMap()
+        
+        let map = app.maps.firstMatch
+        let startTime = Date()
+        
+        XCTAssertTrue(map.waitForExistence(timeout: 2), "Map should load within 2 seconds")
+        
+        let loadTime = Date().timeIntervalSince(startTime)
+        XCTAssertLessThan(loadTime, 2.0, "Map load time should be under 2 seconds")
+    }
+    
+    // MARK: - Helper Methods
+    
+    private func navigateToProfileCreation() {
+        app.launchArguments.append("First-Time-User")
+        app.launch()
+        
+        let signInButton = app.buttons["Sign in with Apple"]
+        if signInButton.exists {
+            signInButton.tap()
+        }
+        
+        let profileTitle = app.navigationBars["Create Profile"]
+        _ = profileTitle.waitForExistence(timeout: 5)
+    }
+    
+    private func navigateToMap() {
+        app.launchArguments.append("Returning-User")
+        app.launch()
+        
+        let mapTab = app.tabBars.buttons["Map"]
+        if mapTab.exists {
+            mapTab.tap()
+        }
+    }
+    
+    private func navigateToConnections() {
+        navigateToMap()
+        
+        let connectionsTab = app.tabBars.buttons["Connections"]
+        connectionsTab.tap()
+    }
+    
+    private func navigateToProfile() {
+        navigateToMap()
+        
+        let profileTab = app.tabBars.buttons["Profile"]
+        profileTab.tap()
+    }
+    
+    private func navigateToChat() {
+        app.launchArguments.append("Has-Active-Connection")
+        navigateToConnections()
+        
+        let firstConnection = app.cells.firstMatch
+        firstConnection.tap()
+    }
+    
+    private func tapFirstUserAnnotation() {
+        app.launchArguments.append("Has-Nearby-Users")
+        
+        let map = app.maps.firstMatch
+        _ = map.waitForExistence(timeout: 2)
+        
+        // Tap on map annotation (coordinates may vary)
+        let annotation = map.otherElements.firstMatch
+        if annotation.exists {
+            annotation.tap()
+        }
+    }
+    
+    private func navigateToIceBreakerSelection() {
+        navigateToMap()
+        tapFirstUserAnnotation()
+        
+        let sendButton = app.buttons["Send Ice Breaker"]
+        sendButton.tap()
+    }
+}
+
+// MARK: - Unit Tests for Models and Services
+// File: ChipperTests.swift
+
+import XCTest
+@testable import Chipper
+
+class ChipperUnitTests: XCTestCase {
+    
+    // MARK: - Geohash Tests
+    
+    func testGeohashEncode() {
+        let lat = 37.7749
+        let lon = -122.4194
+        
+        let geohash = Geohash.encode(latitude: lat, longitude: lon, precision: 7)
+        
+        XCTAssertEqual(geohash.count, 7, "Geohash should have correct precision")
+        XCTAssertFalse(geohash.isEmpty, "Geohash should not be empty")
+    }
+    
+    func testGeohashConsistency() {
+        let lat = 37.7749
+        let lon = -122.4194
+        
+        let hash1 = Geohash.encode(latitude: lat, longitude: lon, precision: 7)
+        let hash2 = Geohash.encode(latitude: lat, longitude: lon, precision: 7)
+        
+        XCTAssertEqual(hash1, hash2, "Same coordinates should produce same geohash")
+    }
+    
+    func testGeohashNearbyLocations() {
+        let lat1 = 37.7749
+        let lon1 = -122.4194
+        
+        let lat2 = 37.7750 // Very close location
+        let lon2 = -122.4195
+        
+        let hash1 = Geohash.encode(latitude: lat1, longitude: lon1, precision: 5)
+        let hash2 = Geohash.encode(latitude: lat2, longitude: lon2, precision: 5)
+        
+        XCTAssertEqual(hash1, hash2, "Very close locations should have same geohash at precision 5")
+    }
+    
+    // MARK: - Model Tests
+    
+    func testUserProfileInitialization() {
+        let profile = UserProfile(
+            userId: "test123",
+            displayName: "Test User",
+            bio: "Test bio",
+            avatarURL: "https://example.com/avatar.jpg",
+            isVisible: true,
+            latitude: 37.7749,
+            longitude: -122.4194,
+            geohash: "9q8yy",
+            lastActive: Date()
+        )
+        
+        XCTAssertEqual(profile.userId, "test123")
+        XCTAssertEqual(profile.displayName, "Test User")
+        XCTAssertEqual(profile.bio, "Test bio")
+        XCTAssertTrue(profile.isVisible)
+    }
+    
+    func testUserProfileCoordinate() {
+        let profile = UserProfile(
+            userId: "test123",
+            displayName: "Test User",
+            bio: "Test bio",
+            avatarURL: nil,
+            isVisible: true,
+            latitude: 37.7749,
+            longitude: -122.4194,
+            geohash: "9q8yy",
+            lastActive: Date()
+        )
+        
+        let coordinate = profile.coordinate
+        XCTAssertEqual(coordinate.latitude, 37.7749, accuracy: 0.0001)
+        XCTAssertEqual(coordinate.longitude, -122.4194, accuracy: 0.0001)
+    }
+    
+    func testConnectionStatusEnum() {
+        XCTAssertEqual(Connection.ConnectionStatus.pending.rawValue, "pending")
+        XCTAssertEqual(Connection.ConnectionStatus.accepted.rawValue, "accepted")
+        XCTAssertEqual(Connection.ConnectionStatus.declined.rawValue, "declined")
+    }
+    
+    // MARK: - Distance Calculation Tests
+    
+    func testDistanceCalculation() {
+        let coord1 = CLLocationCoordinate2D(latitude: 37.7749, longitude: -122.4194)
+        let coord2 = CLLocationCoordinate2D(latitude: 37.7750, longitude: -122.4195)
+        
+        let distance = coord1.distance(to: coord2)
+        
+        XCTAssertGreaterThan(distance, 0, "Distance should be positive")
+        XCTAssertLessThan(distance, 50, "Distance should be less than 50 meters for this example")
+    }
+    
+    func testDistanceToSelf() {
+        let coord = CLLocationCoordinate2D(latitude: 37.7749, longitude: -122.4194)
+        
+        let distance = coord.distance(to: coord)
+        
+        XCTAssertEqual(distance, 0, accuracy: 0.1, "Distance to same coordinate should be 0")
+    }
+    
+    func testDistance200Meters() {
+        let coord1 = CLLocationCoordinate2D(latitude: 37.7749, longitude: -122.4194)
+        let coord2 = CLLocationCoordinate2D(latitude: 37.7767, longitude: -122.4194) // ~200m north
+        
+        let distance = coord1.distance(to: coord2)
+        
+        XCTAssertGreaterThan(distance, 150, "Distance should be approximately 200m")
+        XCTAssertLessThan(distance, 250, "Distance should be approximately 200m")
+    }
+    
+    // MARK: - Image Extension Tests
+    
+    func testImageResize() {
+        let originalSize = CGSize(width: 1000, height: 1000)
+        let image = createTestImage(size: originalSize)
+        
+        let targetSize = CGSize(width: 400, height: 400)
+        let resized = image.resized(to: targetSize)
+        
+        XCTAssertEqual(resized.size.width, 400, accuracy: 1)
+        XCTAssertEqual(resized.size.height, 400, accuracy: 1)
+    }
+    
+    func testImageCrop() {
+        let size = CGSize(width: 1000, height: 800)
+        let image = createTestImage(size: size)
+        
+        let cropped = image.cropped()
+        
+        XCTAssertEqual(cropped.size.width, cropped.size.height, "Cropped image should be square")
+        XCTAssertEqual(cropped.size.width, 800, accuracy: 1, "Should crop to smaller dimension")
+    }
+    
+    // MARK: - Helper Methods
+    
+    private func createTestImage(size: CGSize) -> UIImage {
+        UIGraphicsBeginImageContext(size)
+        let context = UIGraphicsGetCurrentContext()
+        context?.setFillColor(UIColor.blue.cgColor)
+        context?.fill(CGRect(origin: .zero, size: size))
+        let image = UIGraphicsGetImageFromCurrentImageContext()
+        UIGraphicsEndImageContext()
+        return image ?? UIImage()
+    }
+}
+
+// MARK: - Test Configuration
+// File: ChipperTestConfiguration.swift
+
+import Foundation
+
+struct TestConfiguration {
+    static let mockUsers = [
+        MockUser(id: "user1", name: "Alice", lat: 37.7749, lon: -122.4194),
+        MockUser(id: "user2", name: "Bob", lat: 37.7750, lon: -122.4195),
+        MockUser(id: "user3", name: "Charlie", lat: 37.7748, lon: -122.4193)
+    ]
+    
+    static let mockIceBreakers = [
+        "Hey, I'm nearby! 👋",
+        "Want to chat?",
+        "I noticed we're in the same area!",
+        "Mind if I say hi? 😊",
+        "Would love to connect!"
+    ]
+}
+
+struct MockUser {
+    let id: String
+    let name: String
+    let lat: Double
+    let lon: Double
+}
+
+// MARK: - Launch Arguments Helper
+extension XCUIApplication {
+    func setMockScenario(_ scenario: TestScenario) {
+        launchArguments.append(scenario.rawValue)
+    }
+}
+
+enum TestScenario: String {
+    case firstTimeUser = "First-Time-User"
+    case returningUser = "Returning-User"
+    case noConnections = "No-Connections"
+    case hasPendingRequest = "Has-Pending-Request"
+    case hasActiveConnection = "Has-Active-Connection"
+    case hasNearbyUsers = "Has-Nearby-Users"
+}

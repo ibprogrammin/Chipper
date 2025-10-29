@@ -1,0 +1,1235 @@
+// MARK: - App Entry Point
+import SwiftUI
+import Firebase
+
+@main
+struct IceBreakerApp: App {
+    @StateObject private var authViewModel = AuthenticationViewModel()
+    
+    init() {
+        FirebaseApp.configure()
+    }
+    
+    var body: some Scene {
+        WindowGroup {
+            ContentView()
+                .environmentObject(authViewModel)
+        }
+    }
+}
+
+// MARK: - Models
+import Foundation
+import CoreLocation
+import FirebaseFirestore
+
+struct UserProfile: Identifiable, Codable {
+    @DocumentID var id: String?
+    let userId: String
+    var displayName: String
+    var bio: String
+    var avatarURL: String?
+    var isVisible: Bool
+    var latitude: Double
+    var longitude: Double
+    var geohash: String
+    var lastActive: Date
+    
+    var coordinate: CLLocationCoordinate2D {
+        CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
+    }
+}
+
+struct Connection: Identifiable, Codable {
+    @DocumentID var id: String?
+    let user1: String
+    let user2: String
+    var status: ConnectionStatus
+    let initiatedBy: String
+    let iceBreaker: String
+    let createdAt: Date
+    
+    enum ConnectionStatus: String, Codable {
+        case pending, accepted, declined
+    }
+}
+
+struct Message: Identifiable, Codable {
+    @DocumentID var id: String?
+    let senderId: String
+    let text: String
+    let timestamp: Date
+}
+
+// MARK: - Firebase Services
+import FirebaseAuth
+import FirebaseStorage
+import FirebaseFirestore
+
+class FirebaseService {
+    static let shared = FirebaseService()
+    let db = Firestore.firestore()
+    let storage = Storage.storage()
+    
+    private init() {}
+    
+    // MARK: - User Profile
+    func createUserProfile(_ profile: UserProfile) async throws {
+        try db.collection("users").document(profile.userId).setData(from: profile)
+    }
+    
+    func updateUserProfile(_ profile: UserProfile) async throws {
+        guard let userId = profile.id else { return }
+        try db.collection("users").document(userId).setData(from: profile, merge: true)
+    }
+    
+    func fetchUserProfile(userId: String) async throws -> UserProfile? {
+        let document = try await db.collection("users").document(userId).getDocument()
+        return try document.data(as: UserProfile.self)
+    }
+    
+    func updateUserLocation(userId: String, coordinate: CLLocationCoordinate2D) async throws {
+        let geohash = Geohash.encode(latitude: coordinate.latitude, longitude: coordinate.longitude, precision: 7)
+        
+        try await db.collection("users").document(userId).updateData([
+            "latitude": coordinate.latitude,
+            "longitude": coordinate.longitude,
+            "geohash": geohash,
+            "lastActive": FieldValue.serverTimestamp()
+        ])
+    }
+    
+    func fetchNearbyUsers(center: CLLocationCoordinate2D, radiusInMeters: Double = 200) async throws -> [UserProfile] {
+        let geohash = Geohash.encode(latitude: center.latitude, longitude: center.longitude, precision: 5)
+        let neighbors = Geohash.neighbors(geohash: geohash)
+        
+        var allUsers: [UserProfile] = []
+        
+        for hash in [geohash] + neighbors {
+            let snapshot = try await db.collection("users")
+                .whereField("geohash", isGreaterThanOrEqualTo: hash)
+                .whereField("geohash", isLessThan: hash + "~")
+                .whereField("isVisible", isEqualTo: true)
+                .getDocuments()
+            
+            let users = try snapshot.documents.compactMap { try $0.data(as: UserProfile.self) }
+            allUsers.append(contentsOf: users)
+        }
+        
+        // Filter by actual distance
+        return allUsers.filter { user in
+            let distance = center.distance(to: user.coordinate)
+            return distance <= radiusInMeters
+        }
+    }
+    
+    // MARK: - Avatar Upload
+    func uploadAvatar(userId: String, image: UIImage) async throws -> String {
+        guard let imageData = image.jpegData(compressionQuality: 0.7) else {
+            throw NSError(domain: "ImageError", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to compress image"])
+        }
+        
+        let storageRef = storage.reference().child("avatars/\(userId)/profile.jpg")
+        let metadata = StorageMetadata()
+        metadata.contentType = "image/jpeg"
+        
+        _ = try await storageRef.putDataAsync(imageData, metadata: metadata)
+        let downloadURL = try await storageRef.downloadURL()
+        return downloadURL.absoluteString
+    }
+    
+    // MARK: - Connections
+    func sendIceBreakerRequest(from senderId: String, to receiverId: String, iceBreaker: String) async throws {
+        let connectionId = [senderId, receiverId].sorted().joined(separator: "_")
+        
+        let connection = Connection(
+            id: connectionId,
+            user1: senderId,
+            user2: receiverId,
+            status: .pending,
+            initiatedBy: senderId,
+            iceBreaker: iceBreaker,
+            createdAt: Date()
+        )
+        
+        try db.collection("connections").document(connectionId).setData(from: connection)
+    }
+    
+    func updateConnectionStatus(connectionId: String, status: Connection.ConnectionStatus) async throws {
+        try await db.collection("connections").document(connectionId).updateData([
+            "status": status.rawValue
+        ])
+    }
+    
+    func fetchConnections(for userId: String) async throws -> [Connection] {
+        let snapshot1 = try await db.collection("connections")
+            .whereField("user1", isEqualTo: userId)
+            .getDocuments()
+        
+        let snapshot2 = try await db.collection("connections")
+            .whereField("user2", isEqualTo: userId)
+            .getDocuments()
+        
+        let connections1 = try snapshot1.documents.compactMap { try $0.data(as: Connection.self) }
+        let connections2 = try snapshot2.documents.compactMap { try $0.data(as: Connection.self) }
+        
+        return connections1 + connections2
+    }
+    
+    // MARK: - Messaging
+    func sendMessage(connectionId: String, senderId: String, text: String) async throws {
+        let message = Message(senderId: senderId, text: text, timestamp: Date())
+        try db.collection("messages").document(connectionId)
+            .collection("messages").addDocument(from: message)
+    }
+    
+    func listenToMessages(connectionId: String, completion: @escaping ([Message]) -> Void) -> ListenerRegistration {
+        return db.collection("messages").document(connectionId)
+            .collection("messages")
+            .order(by: "timestamp", descending: false)
+            .addSnapshotListener { snapshot, error in
+                guard let documents = snapshot?.documents else { return }
+                let messages = documents.compactMap { try? $0.data(as: Message.self) }
+                completion(messages)
+            }
+    }
+}
+
+// MARK: - Location Manager
+import Combine
+
+class LocationManager: NSObject, ObservableObject {
+    private let manager = CLLocationManager()
+    @Published var location: CLLocation?
+    @Published var authorizationStatus: CLAuthorizationStatus = .notDetermined
+    
+    override init() {
+        super.init()
+        manager.delegate = self
+        manager.desiredAccuracy = kCLLocationAccuracyBest
+        manager.distanceFilter = 50 // Update every 50 meters
+    }
+    
+    func requestPermission() {
+        manager.requestWhenInUseAuthorization()
+    }
+    
+    func startUpdating() {
+        manager.startUpdatingLocation()
+    }
+    
+    func stopUpdating() {
+        manager.stopUpdatingLocation()
+    }
+}
+
+extension LocationManager: CLLocationManagerDelegate {
+    func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        authorizationStatus = manager.authorizationStatus
+        
+        if authorizationStatus == .authorizedWhenInUse || authorizationStatus == .authorizedAlways {
+            startUpdating()
+        }
+    }
+    
+    func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+        location = locations.last
+    }
+}
+
+// MARK: - Geohash Helper
+struct Geohash {
+    private static let base32 = Array("0123456789bcdefghjkmnpqrstuvwxyz")
+    
+    static func encode(latitude: Double, longitude: Double, precision: Int = 7) -> String {
+        var latRange = (-90.0, 90.0)
+        var lonRange = (-180.0, 180.0)
+        var geohash = ""
+        var bits = 0
+        var bit = 0
+        var isEven = true
+        
+        while geohash.count < precision {
+            if isEven {
+                let mid = (lonRange.0 + lonRange.1) / 2
+                if longitude > mid {
+                    bit |= (1 << (4 - bits))
+                    lonRange.0 = mid
+                } else {
+                    lonRange.1 = mid
+                }
+            } else {
+                let mid = (latRange.0 + latRange.1) / 2
+                if latitude > mid {
+                    bit |= (1 << (4 - bits))
+                    latRange.0 = mid
+                } else {
+                    latRange.1 = mid
+                }
+            }
+            
+            isEven = !isEven
+            bits += 1
+            
+            if bits == 5 {
+                geohash.append(base32[bit])
+                bits = 0
+                bit = 0
+            }
+        }
+        
+        return geohash
+    }
+    
+    static func neighbors(geohash: String) -> [String] {
+        let neighbors = [
+            "n", "ne", "e", "se", "s", "sw", "w", "nw"
+        ]
+        
+        // Simplified: return geohash prefixes for neighboring cells
+        var result: [String] = []
+        for neighbor in neighbors {
+            result.append(geohash) // Placeholder - proper implementation needed
+        }
+        return result
+    }
+}
+
+// MARK: - Helper Extensions
+extension CLLocationCoordinate2D {
+    func distance(to coordinate: CLLocationCoordinate2D) -> Double {
+        let location1 = CLLocation(latitude: latitude, longitude: longitude)
+        let location2 = CLLocation(latitude: coordinate.latitude, longitude: coordinate.longitude)
+        return location1.distance(from: location2)
+    }
+}
+
+extension UIImage {
+    func resized(to size: CGSize) -> UIImage {
+        UIGraphicsBeginImageContextWithOptions(size, false, 0.0)
+        defer { UIGraphicsEndImageContext() }
+        draw(in: CGRect(origin: .zero, size: size))
+        return UIGraphicsGetImageFromCurrentImageContext() ?? self
+    }
+    
+    func cropped() -> UIImage {
+        let side = min(size.width, size.height)
+        let x = (size.width - side) / 2
+        let y = (size.height - side) / 2
+        let cropRect = CGRect(x: x, y: y, width: side, height: side)
+        
+        guard let cgImage = cgImage?.cropping(to: cropRect) else { return self }
+        return UIImage(cgImage: cgImage, scale: scale, orientation: imageOrientation)
+    }
+}
+
+// MARK: - View Models
+import AuthenticationServices
+
+class AuthenticationViewModel: ObservableObject {
+    @Published var isAuthenticated = false
+    @Published var currentUser: User?
+    @Published var userProfile: UserProfile?
+    
+    init() {
+        checkAuthState()
+    }
+    
+    private func checkAuthState() {
+        if let user = Auth.auth().currentUser {
+            currentUser = user
+            isAuthenticated = true
+            Task {
+                userProfile = try? await FirebaseService.shared.fetchUserProfile(userId: user.uid)
+            }
+        }
+    }
+    
+    func signInWithApple(credential: ASAuthorizationAppleIDCredential) async throws {
+        guard let token = credential.identityToken,
+              let tokenString = String(data: token, encoding: .utf8) else {
+            throw NSError(domain: "AuthError", code: -1)
+        }
+        
+        let firebaseCredential = OAuthProvider.credential(
+            withProviderID: "apple.com",
+            idToken: tokenString,
+            rawNonce: nil
+        )
+        
+        let result = try await Auth.auth().signIn(with: firebaseCredential)
+        
+        await MainActor.run {
+            currentUser = result.user
+            isAuthenticated = true
+        }
+    }
+    
+    func signOut() throws {
+        try Auth.auth().signOut()
+        currentUser = nil
+        userProfile = nil
+        isAuthenticated = false
+    }
+}
+
+class ProfileViewModel: ObservableObject {
+    @Published var displayName = ""
+    @Published var bio = ""
+    @Published var selectedImage: UIImage?
+    @Published var isVisible = true
+    @Published var isLoading = false
+    @Published var errorMessage: String?
+    
+    func saveProfile(userId: String, coordinate: CLLocationCoordinate2D) async {
+        await MainActor.run { isLoading = true }
+        
+        do {
+            var avatarURL: String?
+            
+            if let image = selectedImage {
+                let resized = image.cropped().resized(to: CGSize(width: 400, height: 400))
+                avatarURL = try await FirebaseService.shared.uploadAvatar(userId: userId, image: resized)
+            }
+            
+            let geohash = Geohash.encode(latitude: coordinate.latitude, longitude: coordinate.longitude, precision: 7)
+            
+            let profile = UserProfile(
+                userId: userId,
+                displayName: displayName,
+                bio: bio,
+                avatarURL: avatarURL,
+                isVisible: isVisible,
+                latitude: coordinate.latitude,
+                longitude: coordinate.longitude,
+                geohash: geohash,
+                lastActive: Date()
+            )
+            
+            try await FirebaseService.shared.createUserProfile(profile)
+            
+            await MainActor.run { isLoading = false }
+        } catch {
+            await MainActor.run {
+                errorMessage = error.localizedDescription
+                isLoading = false
+            }
+        }
+    }
+}
+
+class MapViewModel: ObservableObject {
+    @Published var nearbyUsers: [UserProfile] = []
+    @Published var isLoading = false
+    
+    func fetchNearbyUsers(center: CLLocationCoordinate2D) async {
+        await MainActor.run { isLoading = true }
+        
+        do {
+            let users = try await FirebaseService.shared.fetchNearbyUsers(center: center)
+            await MainActor.run {
+                nearbyUsers = users
+                isLoading = false
+            }
+        } catch {
+            await MainActor.run { isLoading = false }
+            print("Error fetching nearby users: \(error)")
+        }
+    }
+    
+    func updateLocation(userId: String, coordinate: CLLocationCoordinate2D) async {
+        do {
+            try await FirebaseService.shared.updateUserLocation(userId: userId, coordinate: coordinate)
+        } catch {
+            print("Error updating location: \(error)")
+        }
+    }
+}
+
+class ConnectionViewModel: ObservableObject {
+    @Published var connections: [Connection] = []
+    @Published var pendingRequests: [Connection] = []
+    
+    func fetchConnections(userId: String) async {
+        do {
+            let allConnections = try await FirebaseService.shared.fetchConnections(for: userId)
+            await MainActor.run {
+                connections = allConnections.filter { $0.status == .accepted }
+                pendingRequests = allConnections.filter { $0.status == .pending && $0.initiatedBy != userId }
+            }
+        } catch {
+            print("Error fetching connections: \(error)")
+        }
+    }
+    
+    func sendIceBreaker(from senderId: String, to receiverId: String, message: String) async throws {
+        try await FirebaseService.shared.sendIceBreakerRequest(from: senderId, to: receiverId, iceBreaker: message)
+    }
+    
+    func respondToRequest(connectionId: String, accept: Bool) async throws {
+        let status: Connection.ConnectionStatus = accept ? .accepted : .declined
+        try await FirebaseService.shared.updateConnectionStatus(connectionId: connectionId, status: status)
+    }
+}
+
+class ChatViewModel: ObservableObject {
+    @Published var messages: [Message] = []
+    private var listener: ListenerRegistration?
+    
+    func startListening(connectionId: String) {
+        listener = FirebaseService.shared.listenToMessages(connectionId: connectionId) { [weak self] messages in
+            DispatchQueue.main.async {
+                self?.messages = messages
+            }
+        }
+    }
+    
+    func stopListening() {
+        listener?.remove()
+    }
+    
+    func sendMessage(connectionId: String, senderId: String, text: String) async throws {
+        try await FirebaseService.shared.sendMessage(connectionId: connectionId, senderId: senderId, text: text)
+    }
+}
+
+// MARK: - Views
+struct ContentView: View {
+    @EnvironmentObject var authViewModel: AuthenticationViewModel
+    
+    var body: some View {
+        Group {
+            if authViewModel.isAuthenticated {
+                if authViewModel.userProfile != nil {
+                    MainTabView()
+                } else {
+                    ProfileCreationView()
+                }
+            } else {
+                SignInView()
+            }
+        }
+    }
+}
+
+struct SignInView: View {
+    @EnvironmentObject var authViewModel: AuthenticationViewModel
+    @State private var errorMessage: String?
+    
+    var body: some View {
+        VStack(spacing: 20) {
+            Spacer()
+            
+            Image(systemName: "mappin.and.ellipse")
+                .font(.system(size: 80))
+                .foregroundColor(.blue)
+            
+            Text("IceBreaker")
+                .font(.largeTitle)
+                .bold()
+            
+            Text("Connect with people nearby")
+                .foregroundColor(.gray)
+            
+            Spacer()
+            
+            SignInWithAppleButton(.signIn) { request in
+                request.requestedScopes = [.fullName, .email]
+            } onCompletion: { result in
+                switch result {
+                case .success(let authorization):
+                    if let credential = authorization.credential as? ASAuthorizationAppleIDCredential {
+                        Task {
+                            do {
+                                try await authViewModel.signInWithApple(credential: credential)
+                            } catch {
+                                errorMessage = error.localizedDescription
+                            }
+                        }
+                    }
+                case .failure(let error):
+                    errorMessage = error.localizedDescription
+                }
+            }
+            .signInWithAppleButtonStyle(.black)
+            .frame(height: 50)
+            .padding(.horizontal, 40)
+            
+            if let error = errorMessage {
+                Text(error)
+                    .foregroundColor(.red)
+                    .font(.caption)
+            }
+            
+            Spacer()
+        }
+        .padding()
+    }
+}
+
+import PhotosUI
+
+struct ProfileCreationView: View {
+    @EnvironmentObject var authViewModel: AuthenticationViewModel
+    @StateObject private var viewModel = ProfileViewModel()
+    @StateObject private var locationManager = LocationManager()
+    @State private var selectedItem: PhotosPickerItem?
+    
+    var body: some View {
+        NavigationView {
+            Form {
+                Section("Avatar") {
+                    HStack {
+                        Spacer()
+                        if let image = viewModel.selectedImage {
+                            Image(uiImage: image)
+                                .resizable()
+                                .scaledToFill()
+                                .frame(width: 120, height: 120)
+                                .clipShape(Circle())
+                        } else {
+                            Image(systemName: "person.crop.circle.fill")
+                                .font(.system(size: 120))
+                                .foregroundColor(.gray)
+                        }
+                        Spacer()
+                    }
+                    
+                    PhotosPicker(selection: $selectedItem, matching: .images) {
+                        Label("Choose Photo", systemImage: "photo")
+                    }
+                    .onChange(of: selectedItem) { newItem in
+                        Task {
+                            if let data = try? await newItem?.loadTransferable(type: Data.self),
+                               let image = UIImage(data: data) {
+                                viewModel.selectedImage = image
+                            }
+                        }
+                    }
+                }
+                
+                Section("Profile") {
+                    TextField("Display Name", text: $viewModel.displayName)
+                    TextField("Bio", text: $viewModel.bio, axis: .vertical)
+                        .lineLimit(3...6)
+                }
+                
+                Section("Privacy") {
+                    Toggle("Visible to nearby users", isOn: $viewModel.isVisible)
+                }
+                
+                Section {
+                    Button(action: saveProfile) {
+                        if viewModel.isLoading {
+                            ProgressView()
+                        } else {
+                            Text("Create Profile")
+                        }
+                    }
+                    .disabled(viewModel.displayName.isEmpty || viewModel.isLoading || locationManager.location == nil)
+                }
+                
+                if let error = viewModel.errorMessage {
+                    Section {
+                        Text(error)
+                            .foregroundColor(.red)
+                    }
+                }
+            }
+            .navigationTitle("Create Profile")
+            .onAppear {
+                locationManager.requestPermission()
+            }
+        }
+    }
+    
+    private func saveProfile() {
+        guard let userId = authViewModel.currentUser?.uid,
+              let location = locationManager.location else { return }
+        
+        Task {
+            await viewModel.saveProfile(userId: userId, coordinate: location.coordinate)
+            
+            // Refresh user profile
+            authViewModel.userProfile = try? await FirebaseService.shared.fetchUserProfile(userId: userId)
+        }
+    }
+}
+
+struct MainTabView: View {
+    var body: some View {
+        TabView {
+            MapView()
+                .tabItem {
+                    Label("Map", systemImage: "map")
+                }
+            
+            ConnectionsView()
+                .tabItem {
+                    Label("Connections", systemImage: "person.2")
+                }
+            
+            ProfileView()
+                .tabItem {
+                    Label("Profile", systemImage: "person.circle")
+                }
+        }
+    }
+}
+
+import MapKit
+
+struct MapView: View {
+    @EnvironmentObject var authViewModel: AuthenticationViewModel
+    @StateObject private var viewModel = MapViewModel()
+    @StateObject private var locationManager = LocationManager()
+    @State private var region = MKCoordinateRegion(
+        center: CLLocationCoordinate2D(latitude: 37.7749, longitude: -122.4194),
+        span: MKCoordinateSpan(latitudeDelta: 0.01, longitudeDelta: 0.01)
+    )
+    @State private var selectedUser: UserProfile?
+    
+    var body: some View {
+        NavigationView {
+            ZStack {
+                Map(coordinateRegion: $region, annotationItems: viewModel.nearbyUsers) { user in
+                    MapAnnotation(coordinate: user.coordinate) {
+                        UserAnnotationView(user: user)
+                            .onTapGesture {
+                                selectedUser = user
+                            }
+                    }
+                }
+                .ignoresSafeArea()
+                
+                VStack {
+                    Spacer()
+                    Button(action: refreshNearbyUsers) {
+                        Label("Refresh", systemImage: "arrow.clockwise")
+                            .padding()
+                            .background(Color.blue)
+                            .foregroundColor(.white)
+                            .cornerRadius(10)
+                    }
+                    .padding()
+                }
+            }
+            .navigationTitle("Nearby")
+            .sheet(item: $selectedUser) { user in
+                UserProfileSheet(user: user)
+            }
+            .onAppear {
+                locationManager.requestPermission()
+                updateLocation()
+            }
+            .onChange(of: locationManager.location) { newLocation in
+                if let location = newLocation {
+                    region.center = location.coordinate
+                    updateLocation()
+                }
+            }
+        }
+    }
+    
+    private func updateLocation() {
+        guard let userId = authViewModel.currentUser?.uid,
+              let location = locationManager.location else { return }
+        
+        Task {
+            await viewModel.updateLocation(userId: userId, coordinate: location.coordinate)
+        }
+    }
+    
+    private func refreshNearbyUsers() {
+        guard let location = locationManager.location else { return }
+        
+        Task {
+            await viewModel.fetchNearbyUsers(center: location.coordinate)
+        }
+    }
+}
+
+struct UserAnnotationView: View {
+    let user: UserProfile
+    
+    var body: some View {
+        VStack {
+            if let urlString = user.avatarURL, let url = URL(string: urlString) {
+                AsyncImage(url: url) { image in
+                    image
+                        .resizable()
+                        .scaledToFill()
+                } placeholder: {
+                    Image(systemName: "person.circle.fill")
+                        .foregroundColor(.blue)
+                }
+                .frame(width: 40, height: 40)
+                .clipShape(Circle())
+                .overlay(Circle().stroke(Color.white, lineWidth: 2))
+            } else {
+                Image(systemName: "person.circle.fill")
+                    .font(.system(size: 40))
+                    .foregroundColor(.blue)
+                    .overlay(Circle().stroke(Color.white, lineWidth: 2))
+            }
+            
+            Text(user.displayName)
+                .font(.caption)
+                .padding(4)
+                .background(Color.white.opacity(0.8))
+                .cornerRadius(4)
+        }
+    }
+}
+
+struct UserProfileSheet: View {
+    @EnvironmentObject var authViewModel: AuthenticationViewModel
+    @Environment(\.dismiss) var dismiss
+    let user: UserProfile
+    @State private var showingIceBreakers = false
+    
+    var body: some View {
+        NavigationView {
+            VStack(spacing: 20) {
+                if let urlString = user.avatarURL, let url = URL(string: urlString) {
+                    AsyncImage(url: url) { image in
+                        image
+                            .resizable()
+                            .scaledToFill()
+                    } placeholder: {
+                        ProgressView()
+                    }
+                    .frame(width: 150, height: 150)
+                    .clipShape(Circle())
+                } else {
+                    Image(systemName: "person.circle.fill")
+                        .font(.system(size: 150))
+                        .foregroundColor(.gray)
+                }
+                
+                Text(user.displayName)
+                    .font(.title)
+                    .bold()
+                
+                Text(user.bio)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal)
+                
+                Spacer()
+                
+                Button(action: { showingIceBreakers = true }) {
+                    Text("Send Ice Breaker")
+                        .frame(maxWidth: .infinity)
+                        .padding()
+                        .background(Color.blue)
+                        .foregroundColor(.white)
+                        .cornerRadius(10)
+                }
+                .padding()
+            }
+            .navigationTitle("Profile")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Done") { dismiss() }
+                }
+            }
+            .sheet(isPresented: $showingIceBreakers) {
+                IceBreakerSelectionView(receiverId: user.userId)
+            }
+        }
+    }
+}
+
+struct IceBreakerSelectionView: View {
+    @EnvironmentObject var authViewModel: AuthenticationViewModel
+    @Environment(\.dismiss) var dismiss
+    let receiverId: String
+    
+    let iceBreakers = [
+        "Hey, I'm nearby! 👋",
+        "Want to chat?",
+        "I noticed we're in the same area!",
+        "Mind if I say hi? 😊",
+        "Would love to connect!"
+    ]
+    
+    var body: some View {
+        NavigationView {
+            List(iceBreakers, id: \.self) { iceBreaker in
+                Button(action: {
+                    sendIceBreaker(iceBreaker)
+                }) {
+                    Text(iceBreaker)
+                        .padding()
+                }
+            }
+            .navigationTitle("Choose Ice Breaker")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Cancel") { dismiss() }
+                }
+            }
+        }
+    }
+    
+    private func sendIceBreaker(_ message: String) {
+        guard let senderId = authViewModel.currentUser?.uid else { return }
+        
+        Task {
+            do {
+                try await FirebaseService.shared.sendIceBreakerRequest(
+                    from: senderId,
+                    to: receiverId,
+                    iceBreaker: message
+                )
+                dismiss()
+            } catch {
+                print("Error sending ice breaker: \(error)")
+            }
+        }
+    }
+}
+
+struct ConnectionsView: View {
+    @EnvironmentObject var authViewModel: AuthenticationViewModel
+    @StateObject private var viewModel = ConnectionViewModel()
+    
+    var body: some View {
+        NavigationView {
+            List {
+                if !viewModel.pendingRequests.isEmpty {
+                    Section("Pending Requests") {
+                        ForEach(viewModel.pendingRequests) { request in
+                            PendingRequestRow(request: request, viewModel: viewModel)
+                        }
+                    }
+                }
+                
+                Section("Active Connections") {
+                    if viewModel.connections.isEmpty {
+                        Text("No connections yet")
+                            .foregroundColor(.gray)
+                    } else {
+                        ForEach(viewModel.connections) { connection in
+                            NavigationLink(destination: ChatView(connection: connection)) {
+                                ConnectionRow(connection: connection)
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Connections")
+            .onAppear {
+                loadConnections()
+            }
+            .refreshable {
+                loadConnections()
+            }
+        }
+    }
+    
+    private func loadConnections() {
+        guard let userId = authViewModel.currentUser?.uid else { return }
+        Task {
+            await viewModel.fetchConnections(userId: userId)
+        }
+    }
+}
+
+struct PendingRequestRow: View {
+    let request: Connection
+    @ObservedObject var viewModel: ConnectionViewModel
+    @State private var isProcessing = false
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(request.iceBreaker)
+                .font(.body)
+            
+            HStack {
+                Button(action: { acceptRequest() }) {
+                    Text("Accept")
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 20)
+                        .padding(.vertical, 8)
+                        .background(Color.green)
+                        .cornerRadius(8)
+                }
+                .disabled(isProcessing)
+                
+                Button(action: { declineRequest() }) {
+                    Text("Decline")
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 20)
+                        .padding(.vertical, 8)
+                        .background(Color.red)
+                        .cornerRadius(8)
+                }
+                .disabled(isProcessing)
+            }
+        }
+        .padding(.vertical, 4)
+    }
+    
+    private func acceptRequest() {
+        guard let connectionId = request.id else { return }
+        isProcessing = true
+        
+        Task {
+            do {
+                try await viewModel.respondToRequest(connectionId: connectionId, accept: true)
+                // Reload connections
+                if let userId = Auth.auth().currentUser?.uid {
+                    await viewModel.fetchConnections(userId: userId)
+                }
+            } catch {
+                print("Error accepting request: \(error)")
+            }
+            isProcessing = false
+        }
+    }
+    
+    private func declineRequest() {
+        guard let connectionId = request.id else { return }
+        isProcessing = true
+        
+        Task {
+            do {
+                try await viewModel.respondToRequest(connectionId: connectionId, accept: false)
+                // Reload connections
+                if let userId = Auth.auth().currentUser?.uid {
+                    await viewModel.fetchConnections(userId: userId)
+                }
+            } catch {
+                print("Error declining request: \(error)")
+            }
+            isProcessing = false
+        }
+    }
+}
+
+struct ConnectionRow: View {
+    let connection: Connection
+    @State private var otherUserProfile: UserProfile?
+    
+    var body: some View {
+        HStack {
+            if let profile = otherUserProfile {
+                if let urlString = profile.avatarURL, let url = URL(string: urlString) {
+                    AsyncImage(url: url) { image in
+                        image
+                            .resizable()
+                            .scaledToFill()
+                    } placeholder: {
+                        Image(systemName: "person.circle.fill")
+                            .foregroundColor(.gray)
+                    }
+                    .frame(width: 50, height: 50)
+                    .clipShape(Circle())
+                } else {
+                    Image(systemName: "person.circle.fill")
+                        .font(.system(size: 50))
+                        .foregroundColor(.gray)
+                }
+                
+                VStack(alignment: .leading) {
+                    Text(profile.displayName)
+                        .font(.headline)
+                    Text("Tap to chat")
+                        .font(.caption)
+                        .foregroundColor(.gray)
+                }
+            } else {
+                ProgressView()
+            }
+        }
+        .onAppear {
+            loadOtherUserProfile()
+        }
+    }
+    
+    private func loadOtherUserProfile() {
+        guard let currentUserId = Auth.auth().currentUser?.uid else { return }
+        let otherUserId = connection.user1 == currentUserId ? connection.user2 : connection.user1
+        
+        Task {
+            otherUserProfile = try? await FirebaseService.shared.fetchUserProfile(userId: otherUserId)
+        }
+    }
+}
+
+struct ChatView: View {
+    @EnvironmentObject var authViewModel: AuthenticationViewModel
+    let connection: Connection
+    @StateObject private var viewModel = ChatViewModel()
+    @State private var messageText = ""
+    @State private var otherUserProfile: UserProfile?
+    
+    var body: some View {
+        VStack {
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(spacing: 12) {
+                        ForEach(viewModel.messages) { message in
+                            MessageBubble(
+                                message: message,
+                                isFromCurrentUser: message.senderId == authViewModel.currentUser?.uid
+                            )
+                            .id(message.id)
+                        }
+                    }
+                    .padding()
+                }
+                .onChange(of: viewModel.messages.count) { _ in
+                    if let lastMessage = viewModel.messages.last {
+                        withAnimation {
+                            proxy.scrollTo(lastMessage.id, anchor: .bottom)
+                        }
+                    }
+                }
+            }
+            
+            HStack {
+                TextField("Message...", text: $messageText)
+                    .textFieldStyle(RoundedBorderTextFieldStyle())
+                    .onSubmit {
+                        sendMessage()
+                    }
+                
+                Button(action: sendMessage) {
+                    Image(systemName: "arrow.up.circle.fill")
+                        .font(.system(size: 32))
+                        .foregroundColor(.blue)
+                }
+                .disabled(messageText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+            .padding()
+        }
+        .navigationTitle(otherUserProfile?.displayName ?? "Chat")
+        .navigationBarTitleDisplayMode(.inline)
+        .onAppear {
+            if let connectionId = connection.id {
+                viewModel.startListening(connectionId: connectionId)
+            }
+            loadOtherUserProfile()
+        }
+        .onDisappear {
+            viewModel.stopListening()
+        }
+    }
+    
+    private func sendMessage() {
+        let text = messageText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty,
+              let connectionId = connection.id,
+              let senderId = authViewModel.currentUser?.uid else { return }
+        
+        messageText = ""
+        
+        Task {
+            try? await viewModel.sendMessage(connectionId: connectionId, senderId: senderId, text: text)
+        }
+    }
+    
+    private func loadOtherUserProfile() {
+        guard let currentUserId = authViewModel.currentUser?.uid else { return }
+        let otherUserId = connection.user1 == currentUserId ? connection.user2 : connection.user1
+        
+        Task {
+            otherUserProfile = try? await FirebaseService.shared.fetchUserProfile(userId: otherUserId)
+        }
+    }
+}
+
+struct MessageBubble: View {
+    let message: Message
+    let isFromCurrentUser: Bool
+    
+    var body: some View {
+        HStack {
+            if isFromCurrentUser { Spacer() }
+            
+            Text(message.text)
+                .padding(12)
+                .background(isFromCurrentUser ? Color.blue : Color.gray.opacity(0.2))
+                .foregroundColor(isFromCurrentUser ? .white : .primary)
+                .cornerRadius(16)
+            
+            if !isFromCurrentUser { Spacer() }
+        }
+    }
+}
+
+struct ProfileView: View {
+    @EnvironmentObject var authViewModel: AuthenticationViewModel
+    @State private var showingEditProfile = false
+    @State private var showingSignOutAlert = false
+    
+    var body: some View {
+        NavigationView {
+            Form {
+                if let profile = authViewModel.userProfile {
+                    Section {
+                        HStack {
+                            Spacer()
+                            if let urlString = profile.avatarURL, let url = URL(string: urlString) {
+                                AsyncImage(url: url) { image in
+                                    image
+                                        .resizable()
+                                        .scaledToFill()
+                                } placeholder: {
+                                    ProgressView()
+                                }
+                                .frame(width: 120, height: 120)
+                                .clipShape(Circle())
+                            } else {
+                                Image(systemName: "person.circle.fill")
+                                    .font(.system(size: 120))
+                                    .foregroundColor(.gray)
+                            }
+                            Spacer()
+                        }
+                        
+                        LabeledContent("Name", value: profile.displayName)
+                        LabeledContent("Bio", value: profile.bio)
+                    }
+                    
+                    Section("Privacy") {
+                        LabeledContent("Visible to others", value: profile.isVisible ? "Yes" : "No")
+                    }
+                    
+                    Section {
+                        Button("Edit Profile") {
+                            showingEditProfile = true
+                        }
+                    }
+                }
+                
+                Section {
+                    Button("Sign Out", role: .destructive) {
+                        showingSignOutAlert = true
+                    }
+                }
+            }
+            .navigationTitle("Profile")
+            .alert("Sign Out", isPresented: $showingSignOutAlert) {
+                Button("Cancel", role: .cancel) {}
+                Button("Sign Out", role: .destructive) {
+                    try? authViewModel.signOut()
+                }
+            } message: {
+                Text("Are you sure you want to sign out?")
+            }
+        }
+    }
+}
+
+// MARK: - Preview
+struct ContentView_Previews: PreviewProvider {
+    static var previews: some View {
+        ContentView()
+            .environmentObject(AuthenticationViewModel())
+    }
+}

@@ -1,3 +1,7 @@
+// Apple Firebase Auth URL:
+// https://chipper-a9285.firebaseapp.com/__/auth/handler
+
+
 // MARK: - Chipper Automated UI Tests
 // File: ChipperUITests.swift
 

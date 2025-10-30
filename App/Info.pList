@@ -4,5 +4,9 @@
 <dict>
 	<key>Display Name</key>
 	<string>Chipper</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>We need your location to show nearby users</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>To set your profile avatar</string>
 </dict>
 </plist>
